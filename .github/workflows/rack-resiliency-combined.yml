@@ -1,0 +1,1009 @@
+name: Resilience Simulation Combined (GitHub Actions)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional run id (string). If empty, github run id will be used."
+        required: false
+        default: ""
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  LOG_BASE_PATH: /home/vagrant/github-actions-logs/resilience-sim
+  KUBECONFIG: /home/snu/.kube/config
+
+############################
+# NOTE: This workflow uses kubectl to create Jobs on the K8s cluster.
+# The self-hosted runner must have:
+#   1. kubectl installed and configured
+#   2. Access to the Kubernetes cluster (kubeconfig)
+############################
+
+jobs:
+  # =============================================
+  # INITIALIZE - Create shared log directory and Job template
+  # =============================================
+  initialize:
+    name: Initialize Workflow
+    runs-on: [self-hosted, linux]
+    outputs:
+      run_id: ${{ steps.setup.outputs.run_id }}
+      log_dir: ${{ steps.setup.outputs.log_dir }}
+      local_log_dir: ${{ steps.setup.outputs.local_log_dir }}
+      metrics_file: ${{ steps.setup.outputs.metrics_file }}
+      timing_file: ${{ steps.setup.outputs.timing_file }}
+      workflow_start: ${{ steps.setup.outputs.workflow_start }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check kubectl and configure kubeconfig
+        run: |
+          if ! command -v kubectl &> /dev/null; then
+            echo "ERROR: kubectl not found. Please install kubectl on the runner."
+            exit 1
+          fi
+          
+          echo "kubectl version:"
+          kubectl version --client
+          
+          echo ""
+          echo "Searching for kubeconfig..."
+          
+          # Try multiple kubeconfig locations
+          KUBECONFIG_PATHS=(
+            "$HOME/.kube/config"
+            "/home/snu/.kube/config"
+            "/home/snu/kubernetes/kubeconfig-master"
+            "/home/vagrant/.kube/config"
+            "/etc/kubernetes/admin.conf"
+          )
+          
+          FOUND_KUBECONFIG=""
+          for kpath in "${KUBECONFIG_PATHS[@]}"; do
+            if [ -f "$kpath" ]; then
+              echo "Found kubeconfig at: $kpath"
+              FOUND_KUBECONFIG="$kpath"
+              break
+            fi
+          done
+          
+          # If not found, try to fetch from Vagrant master node
+          if [ -z "$FOUND_KUBECONFIG" ]; then
+            echo "No local kubeconfig found. Trying to fetch from Vagrant master-m001..."
+            
+            mkdir -p $HOME/.kube
+            
+            # Try SSH without password (using vagrant insecure key or SSH agent)
+            if scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 vagrant@192.168.56.101:/home/vagrant/.kube/config $HOME/.kube/config 2>/dev/null; then
+              echo "✅ Fetched kubeconfig from master-m001 via SCP"
+              FOUND_KUBECONFIG="$HOME/.kube/config"
+            elif ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 vagrant@192.168.56.101 "cat /home/vagrant/.kube/config" > $HOME/.kube/config 2>/dev/null; then
+              echo "✅ Fetched kubeconfig from master-m001 via SSH"
+              FOUND_KUBECONFIG="$HOME/.kube/config"
+            fi
+          fi
+          
+          # Try with sudo to check other locations
+          if [ -z "$FOUND_KUBECONFIG" ]; then
+            echo "Trying with sudo..."
+            for kpath in "/root/.kube/config" "/etc/kubernetes/admin.conf"; do
+              if sudo test -f "$kpath"; then
+                sudo cp "$kpath" /tmp/kubeconfig
+                sudo chmod 644 /tmp/kubeconfig
+                FOUND_KUBECONFIG="/tmp/kubeconfig"
+                echo "Found kubeconfig at: $kpath (copied to /tmp/kubeconfig)"
+                break
+              fi
+            done
+          fi
+          
+          if [ -z "$FOUND_KUBECONFIG" ]; then
+            echo ""
+            echo "================================================================"
+            echo "ERROR: Cannot find kubeconfig anywhere!"
+            echo ""
+            echo "Please run this command on your runner to find it:"
+            echo "  find / -name 'config' -path '*kube*' 2>/dev/null"
+            echo ""
+            echo "Or copy it from your Vagrant master node:"
+            echo "  scp vagrant@192.168.56.101:/home/vagrant/.kube/config ~/.kube/config"
+            echo ""
+            echo "Or set a GitHub secret KUBE_CONFIG_DATA with base64-encoded kubeconfig"
+            echo "================================================================"
+            exit 1
+          fi
+          
+          export KUBECONFIG="$FOUND_KUBECONFIG"
+          echo "KUBECONFIG=${FOUND_KUBECONFIG}" >> $GITHUB_ENV
+          
+          echo ""
+          echo "Checking cluster connectivity with KUBECONFIG=${FOUND_KUBECONFIG}..."
+          if kubectl get nodes; then
+            echo "✅ Connected to cluster!"
+            echo "USE_SUDO=false" >> $GITHUB_ENV
+          else
+            echo "Direct access failed, trying with sudo..."
+            if sudo KUBECONFIG="${FOUND_KUBECONFIG}" kubectl get nodes; then
+              echo "✅ Cluster accessible with sudo kubectl"
+              echo "USE_SUDO=true" >> $GITHUB_ENV
+            else
+              echo "ERROR: Cannot connect to Kubernetes cluster."
+              echo "Please ensure the cluster is running and accessible."
+              exit 1
+            fi
+          fi
+
+      - name: Setup Run Environment
+        id: setup
+        run: |
+          # Compute RUN_ID
+          if [[ -n "${{ github.event.inputs.run_id }}" ]]; then
+            RUN_ID="${{ github.event.inputs.run_id }}"
+          else
+            RUN_ID="gha-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          fi
+          
+          # Remote log dir (on K8s cluster nodes)
+          LOG_DIR="${{ env.LOG_BASE_PATH }}/${RUN_ID}"
+          
+          # LOCAL log dir (on runner machine for easy extraction)
+          LOCAL_LOG_DIR="/home/snu/kubernetes/comparison-logs/github-actions/${RUN_ID}"
+          mkdir -p "${LOCAL_LOG_DIR}"
+          
+          METRICS_FILE="${LOCAL_LOG_DIR}/metrics.txt"
+          TIMING_FILE="${LOCAL_LOG_DIR}/timing.csv"
+          WORKFLOW_START=$(date +%s)
+          
+          # Initialize timing CSV
+          echo "step,start_epoch,end_epoch,duration_seconds,status" > "${TIMING_FILE}"
+          
+          # Initialize metrics file with unified format
+          cat > "${METRICS_FILE}" << EOF
+          # Resilience Simulation Metrics - GitHub Actions
+          # Generated: $(date '+%Y-%m-%d %H:%M:%S')
+          
+          PLATFORM=GitHub_Actions
+          RUN_ID=${RUN_ID}
+          GITHUB_RUN_ID=${{ github.run_id }}
+          GITHUB_RUN_NUMBER=${{ github.run_number }}
+          GITHUB_ACTOR=${{ github.actor }}
+          GITHUB_REPOSITORY=${{ github.repository }}
+          WORKFLOW_START_EPOCH=${WORKFLOW_START}
+          WORKFLOW_START_ISO=$(date -d @${WORKFLOW_START} '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+          EOF
+          
+          # Set outputs
+          echo "run_id=${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "log_dir=${LOG_DIR}" >> $GITHUB_OUTPUT
+          echo "local_log_dir=${LOCAL_LOG_DIR}" >> $GITHUB_OUTPUT
+          echo "metrics_file=${METRICS_FILE}" >> $GITHUB_OUTPUT
+          echo "timing_file=${TIMING_FILE}" >> $GITHUB_OUTPUT
+          echo "workflow_start=${WORKFLOW_START}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Initialized workflow with RUN_ID: ${RUN_ID}"
+          echo "📁 Remote log directory: ${LOG_DIR}"
+          echo "📁 Local log directory: ${LOCAL_LOG_DIR}"
+
+  # =============================================
+  # PARALLEL HEALTH CHECKS (3x) - Using kubectl run
+  # =============================================
+  health-check-1:
+    name: Health Check 1
+    runs-on: [self-hosted, linux]
+    needs: [initialize]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          # Try to find and set KUBECONFIG
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then
+              export KUBECONFIG="$kpath"
+              echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV
+              break
+            fi
+          done
+          
+          # If no direct access, try sudo
+          if ! kubectl get nodes &> /dev/null; then
+            echo "Using sudo for kubectl..."
+            if sudo test -f /home/snu/.kube/config; then
+              sudo cp /home/snu/.kube/config /tmp/kubeconfig
+              sudo chmod 644 /tmp/kubeconfig
+              echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+            fi
+          fi
+          
+          # Verify
+          kubectl get nodes || sudo kubectl get nodes
+      
+      - name: Run Health Check 1 via kubectl
+        id: health_check
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          LOCAL_LOG_DIR="${{ needs.initialize.outputs.local_log_dir }}"
+          TIMING_FILE="${{ needs.initialize.outputs.timing_file }}"
+          METRICS_FILE="${{ needs.initialize.outputs.metrics_file }}"
+          START_TIME=$(date +%s)
+          
+          # Ensure local log dir exists
+          mkdir -p "${LOCAL_LOG_DIR}"
+          
+          echo "===== HEALTH CHECK 1 STARTED at $(date) ====="
+          
+          # Create a unique job name
+          JOB_NAME="gha-hc1-${RUN_ID##*-}"
+          
+          # Run as a kubectl Job
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: health-check
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      echo "===== HEALTH CHECK 1 ====="
+                      python3 /app/rack_resiliency_to_host.py health-check --stabilization-time 10
+          EOF
+          
+          # Wait for job completion
+          echo "Waiting for job ${JOB_NAME} to complete..."
+          kubectl wait --for=condition=complete --timeout=600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          # Get job status
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          
+          if [ "$JOB_STATUS" == "1" ]; then
+            STATUS="SUCCESS"
+          else
+            STATUS="FAILED"
+          fi
+          
+          # Get logs and save to LOCAL directory
+          echo "===== HEALTH CHECK 1 STARTED at $(date -d @${START_TIME}) =====" > "${LOCAL_LOG_DIR}/health_check_1.log"
+          kubectl logs job/${JOB_NAME} >> "${LOCAL_LOG_DIR}/health_check_1.log" 2>&1
+          echo "===== HEALTH CHECK 1 COMPLETED at $(date) (${STATUS}) =====" >> "${LOCAL_LOG_DIR}/health_check_1.log"
+          
+          # Record timing to LOCAL timing file
+          echo "HEALTH_CHECK_1,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> "${TIMING_FILE}"
+          
+          # Record metrics
+          echo "HEALTH_CHECK_1_START_EPOCH=${START_TIME}" >> "${METRICS_FILE}"
+          echo "HEALTH_CHECK_1_END_EPOCH=${END_TIME}" >> "${METRICS_FILE}"
+          echo "HEALTH_CHECK_1_DURATION_SECONDS=${DURATION}" >> "${METRICS_FILE}"
+          echo "HEALTH_CHECK_1_STATUS=${STATUS}" >> "${METRICS_FILE}"
+          
+          echo "===== HEALTH CHECK 1 COMPLETED in ${DURATION}s (${STATUS}) ====="
+          cat "${LOCAL_LOG_DIR}/health_check_1.log"
+          
+          # Cleanup job
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Health Check 1 Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-1-${{ needs.initialize.outputs.run_id }}
+          path: ${{ needs.initialize.outputs.local_log_dir }}/
+          retention-days: 30
+
+  health-check-2:
+    name: Health Check 2
+    runs-on: [self-hosted, linux]
+    needs: [initialize]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Health Check 2 via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== HEALTH CHECK 2 STARTED at $(date) ====="
+          
+          JOB_NAME="gha-hc2-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: health-check
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== HEALTH CHECK 2 =====" | tee ${LOG_DIR}/health_check_2.log
+                      python3 /app/rack_resiliency_to_host.py health-check --stabilization-time 10 2>&1 | tee -a ${LOG_DIR}/health_check_2.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "HEALTH_CHECK_2,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "===== HEALTH CHECK 2 COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Health Check 2 Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-2-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  health-check-3:
+    name: Health Check 3
+    runs-on: [self-hosted, linux]
+    needs: [initialize]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Health Check 3 via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== HEALTH CHECK 3 STARTED at $(date) ====="
+          
+          JOB_NAME="gha-hc3-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: health-check
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== HEALTH CHECK 3 =====" | tee ${LOG_DIR}/health_check_3.log
+                      python3 /app/rack_resiliency_to_host.py health-check --stabilization-time 10 2>&1 | tee -a ${LOG_DIR}/health_check_3.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "HEALTH_CHECK_3,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "===== HEALTH CHECK 3 COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Health Check 3 Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-3-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  # =============================================
+  # NODE FAILURE SIMULATION
+  # =============================================
+  node-simulation:
+    name: Node Failure Simulation
+    runs-on: [self-hosted, linux]
+    needs: [initialize, health-check-1, health-check-2, health-check-3]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Node Failure Simulation via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== NODE FAILURE SIMULATION STARTED at $(date) ====="
+          
+          JOB_NAME="gha-node-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: node-sim
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  - name: NODE_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.nodeName
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== NODE FAILURE SIMULATION =====" | tee ${LOG_DIR}/node_simulation.log
+                      python3 /app/rack_resiliency_to_host.py simulate-node --stabilization-time 60 2>&1 | tee -a ${LOG_DIR}/node_simulation.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=1800s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "NODE_SIMULATION,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "NODE_SIM_START_EPOCH=${START_TIME}" >> /tmp/gha-logs/metrics.txt
+          echo "NODE_SIM_END_EPOCH=${END_TIME}" >> /tmp/gha-logs/metrics.txt
+          echo "NODE_SIM_DURATION_SECONDS=${DURATION}" >> /tmp/gha-logs/metrics.txt
+          echo "NODE_SIM_STATUS=${STATUS}" >> /tmp/gha-logs/metrics.txt
+          
+          echo "===== NODE FAILURE SIMULATION COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Node Simulation Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-simulation-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  # =============================================
+  # INTERIM HEALTH CHECK
+  # =============================================
+  interim-health-check:
+    name: Interim Health Check
+    runs-on: [self-hosted, linux]
+    needs: [initialize, node-simulation]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Interim Health Check via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== INTERIM HEALTH CHECK STARTED at $(date) ====="
+          
+          JOB_NAME="gha-interim-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: health-check
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== INTERIM HEALTH CHECK =====" | tee ${LOG_DIR}/interim_health_check.log
+                      python3 /app/rack_resiliency_to_host.py health-check --stabilization-time 10 2>&1 | tee -a ${LOG_DIR}/interim_health_check.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "INTERIM_HEALTH_CHECK,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "===== INTERIM HEALTH CHECK COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Interim Health Check Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interim-health-check-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  # =============================================
+  # RACK FAILURE SIMULATION
+  # =============================================
+  rack-simulation:
+    name: Rack Failure Simulation
+    runs-on: [self-hosted, linux]
+    needs: [initialize, interim-health-check]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Rack Failure Simulation via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== RACK FAILURE SIMULATION STARTED at $(date) ====="
+          
+          JOB_NAME="gha-rack-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: rack-sim
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  - name: NODE_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.nodeName
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== RACK FAILURE SIMULATION =====" | tee ${LOG_DIR}/rack_simulation.log
+                      python3 /app/rack_resiliency_to_host.py simulate-rack --stabilization-time 120 --downtime 60 2>&1 | tee -a ${LOG_DIR}/rack_simulation.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=3600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "RACK_SIMULATION,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "RACK_SIM_START_EPOCH=${START_TIME}" >> /tmp/gha-logs/metrics.txt
+          echo "RACK_SIM_END_EPOCH=${END_TIME}" >> /tmp/gha-logs/metrics.txt
+          echo "RACK_SIM_DURATION_SECONDS=${DURATION}" >> /tmp/gha-logs/metrics.txt
+          echo "RACK_SIM_STATUS=${STATUS}" >> /tmp/gha-logs/metrics.txt
+          
+          echo "===== RACK FAILURE SIMULATION COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Rack Simulation Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rack-simulation-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  # =============================================
+  # FINAL HEALTH CHECK
+  # =============================================
+  final-health-check:
+    name: Final Health Check
+    runs-on: [self-hosted, linux]
+    needs: [initialize, rack-simulation]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/etc/kubernetes/admin.conf"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+          if ! kubectl get nodes &> /dev/null; then
+            sudo cp /home/snu/.kube/config /tmp/kubeconfig 2>/dev/null || true
+            sudo chmod 644 /tmp/kubeconfig 2>/dev/null || true
+            echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+          fi
+      
+      - name: Run Final Health Check via kubectl
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOG_DIR="${{ needs.initialize.outputs.log_dir }}"
+          START_TIME=$(date +%s)
+          
+          echo "===== FINAL HEALTH CHECK STARTED at $(date) ====="
+          
+          JOB_NAME="gha-final-${RUN_ID##*-}"
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: default
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: chaos-admin
+                nodeSelector:
+                  kubernetes.io/hostname: master-m003
+                tolerations:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                containers:
+                - name: health-check
+                  image: kushsahni1/chaos-sim:latest
+                  imagePullPolicy: Always
+                  env:
+                  - name: PYTHONUNBUFFERED
+                    value: "1"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      mkdir -p ${LOG_DIR}
+                      echo "===== FINAL HEALTH CHECK =====" | tee ${LOG_DIR}/final_health_check.log
+                      python3 /app/rack_resiliency_to_host.py health-check --stabilization-time 10 2>&1 | tee -a ${LOG_DIR}/final_health_check.log
+                  volumeMounts:
+                  - name: log-vol
+                    mountPath: /home/vagrant/github-actions-logs
+                volumes:
+                - name: log-vol
+                  hostPath:
+                    path: /home/vagrant/github-actions-logs
+                    type: DirectoryOrCreate
+          EOF
+          
+          kubectl wait --for=condition=complete --timeout=600s job/${JOB_NAME} || \
+            kubectl wait --for=condition=failed --timeout=10s job/${JOB_NAME}
+          
+          JOB_STATUS=$(kubectl get job ${JOB_NAME} -o jsonpath='{.status.succeeded}')
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          STATUS=$([ "$JOB_STATUS" == "1" ] && echo "SUCCESS" || echo "FAILED")
+          
+          echo "FINAL_HEALTH_CHECK,${START_TIME},${END_TIME},${DURATION},${STATUS}" >> /tmp/gha-logs/timing.csv
+          echo "===== FINAL HEALTH CHECK COMPLETED in ${DURATION}s (${STATUS}) ====="
+          
+          kubectl logs job/${JOB_NAME}
+          kubectl delete job ${JOB_NAME} --ignore-not-found
+      
+      - name: Upload Final Health Check Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-health-check-${{ needs.initialize.outputs.run_id }}
+          path: /tmp/gha-logs/
+          retention-days: 30
+
+  # =============================================
+  # FINALIZE - Generate Summary & Save All Logs Locally
+  # =============================================
+  finalize:
+    name: Finalize & Generate Summary
+    runs-on: [self-hosted, linux]
+    needs: [initialize, final-health-check]
+    if: always()
+    steps:
+      - name: Configure kubectl
+        run: |
+          for kpath in "$HOME/.kube/config" "/home/snu/.kube/config" "/home/snu/kubernetes/kubeconfig-master"; do
+            if [ -f "$kpath" ]; then echo "KUBECONFIG=${kpath}" >> $GITHUB_ENV; break; fi
+          done
+      
+      - name: Generate Workflow Summary and Save Locally
+        run: |
+          RUN_ID="${{ needs.initialize.outputs.run_id }}"
+          LOCAL_LOG_DIR="${{ needs.initialize.outputs.local_log_dir }}"
+          METRICS_FILE="${{ needs.initialize.outputs.metrics_file }}"
+          TIMING_FILE="${{ needs.initialize.outputs.timing_file }}"
+          WORKFLOW_START="${{ needs.initialize.outputs.workflow_start }}"
+          WORKFLOW_END=$(date +%s)
+          TOTAL_DURATION=$((WORKFLOW_END - WORKFLOW_START))
+          
+          # Ensure local log dir exists
+          mkdir -p "${LOCAL_LOG_DIR}"
+          
+          # Add final metrics
+          cat >> "${METRICS_FILE}" << EOF
+          
+          # Final Summary
+          WORKFLOW_END_EPOCH=${WORKFLOW_END}
+          WORKFLOW_END_ISO=$(date -d @${WORKFLOW_END} '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+          TOTAL_DURATION_SECONDS=${TOTAL_DURATION}
+          TOTAL_DURATION_FORMATTED=$(printf '%02d:%02d:%02d' $((TOTAL_DURATION/3600)) $((TOTAL_DURATION%3600/60)) $((TOTAL_DURATION%60)))
+          WORKFLOW_STATUS=${{ needs.final-health-check.result }}
+          EOF
+          
+          # Create combined log file
+          COMBINED_LOG="${LOCAL_LOG_DIR}/full_execution.log"
+          echo "===== GITHUB ACTIONS RESILIENCE SIMULATION =====" > "${COMBINED_LOG}"
+          echo "Run ID: ${RUN_ID}" >> "${COMBINED_LOG}"
+          echo "Start: $(date -d @${WORKFLOW_START})" >> "${COMBINED_LOG}"
+          echo "End: $(date -d @${WORKFLOW_END})" >> "${COMBINED_LOG}"
+          echo "Duration: ${TOTAL_DURATION} seconds" >> "${COMBINED_LOG}"
+          echo "" >> "${COMBINED_LOG}"
+          
+          # Append all individual log files
+          for log_file in "${LOCAL_LOG_DIR}"/*.log; do
+            if [ -f "$log_file" ] && [ "$log_file" != "${COMBINED_LOG}" ]; then
+              echo "" >> "${COMBINED_LOG}"
+              echo "===== $(basename $log_file) =====" >> "${COMBINED_LOG}"
+              cat "$log_file" >> "${COMBINED_LOG}"
+            fi
+          done
+          
+          # Print summary
+          echo ""
+          echo "===== WORKFLOW SUMMARY ====="
+          echo "Run ID: ${RUN_ID}"
+          echo "Total Duration: ${TOTAL_DURATION} seconds ($(printf '%02d:%02d:%02d' $((TOTAL_DURATION/3600)) $((TOTAL_DURATION%3600/60)) $((TOTAL_DURATION%60))))"
+          echo ""
+          echo "===== LOCAL LOG DIRECTORY ====="
+          echo "${LOCAL_LOG_DIR}"
+          ls -la "${LOCAL_LOG_DIR}"
+          echo ""
+          echo "===== TIMING DATA ====="
+          cat "${TIMING_FILE}" 2>/dev/null || echo "No timing data"
+          echo ""
+          echo "===== METRICS ====="
+          cat "${METRICS_FILE}" 2>/dev/null || echo "No metrics data"
+          
+          # Create a symlink for easy access to latest run
+          LATEST_LINK="/home/snu/kubernetes/comparison-logs/github-actions/LATEST"
+          rm -f "${LATEST_LINK}"
+          ln -sf "${LOCAL_LOG_DIR}" "${LATEST_LINK}"
+          
+          echo ""
+          echo "✅ All logs saved to: ${LOCAL_LOG_DIR}"
+          echo "📁 Quick access: ${LATEST_LINK}"
+      
+      - name: Upload All Logs Bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-logs-${{ needs.initialize.outputs.run_id }}
+          path: ${{ needs.initialize.outputs.local_log_dir }}/
+          retention-days: 90
+      
+      - name: Upload Metrics & Timing Files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ needs.initialize.outputs.run_id }}
+          path: |
+            ${{ needs.initialize.outputs.local_log_dir }}/metrics.txt
+            ${{ needs.initialize.outputs.local_log_dir }}/timing.csv
+          retention-days: 90

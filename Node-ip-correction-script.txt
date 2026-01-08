@@ -1,0 +1,38 @@
+# Define your node list
+NODES=(
+  "master-m001" "master-m002" "master-m003"
+  "worker-w001" "worker-w002" "worker-w003"
+  "worker-w004" "worker-w005" "worker-w006"
+)
+
+echo "🚀 Starting IP Fix for 9 Nodes (Subnet Detection Method)..."
+
+for NODE in "${NODES[@]}"; do
+  echo "------------------------------------------------"
+  echo "🔧 Fixing $NODE..."
+  
+  # Run the fix command via SSH
+  vagrant ssh "$NODE" -c "
+    # 1. Grab the IP strictly matching the Vagrant subnet (192.168.56)
+    # We use 'ip -o' (oneline) to make parsing easier
+    NODE_IP=\$(ip -o -4 addr list | grep '192.168.56' | awk '{print \$4}' | cut -d/ -f1)
+    
+    if [ -z \"\$NODE_IP\" ]; then
+        echo \"❌ ERROR: Could not find 192.168.56.x IP on this node!\"
+        exit 1
+    fi
+
+    echo \"✅ Detected Private IP: \$NODE_IP\"
+
+    # 2. Configure Kubelet to use this specific IP
+    echo \"KUBELET_EXTRA_ARGS=--node-ip=\$NODE_IP\" | sudo tee /etc/default/kubelet
+
+    # 3. Restart Kubelet to apply changes
+    sudo systemctl daemon-reload
+    sudo systemctl restart kubelet
+  "
+done
+
+echo "✅ All nodes updated. Waiting 10s for convergence..."
+sleep 10
+kubectl get nodes -o wide
