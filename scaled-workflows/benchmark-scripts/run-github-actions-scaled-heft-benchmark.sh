@@ -1,6 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# SCALED (2x) HEFT GITHUB ACTIONS BENCHMARK RUNNER
+# SCALED (2x) HEFT GITHUB ACTIONS BENCHMARK RUNNER - FIXED
+# Uses GitHub API timestamps for accurate duration measurement
 #===============================================================================
 
 N_RUNS=${1:-100}
@@ -20,6 +21,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}=============================================="
 echo "SCALED (2x) HEFT GITHUB ACTIONS BENCHMARK"
+echo "(FIXED - Uses GitHub API Timestamps)"
 echo "=============================================="
 echo "Runs: ${N_RUNS} | Scale: 2x | Scheduler: HEFT"
 echo -e "==============================================${NC}"
@@ -27,7 +29,7 @@ echo -e "==============================================${NC}"
 [ -z "$GITHUB_TOKEN" ] && { echo -e "${RED}ERROR: GITHUB_TOKEN not set${NC}"; exit 1; }
 
 mkdir -p "${OUTPUT_DIR}"
-echo "run_id,run_number,start_epoch,end_epoch,duration_seconds,status,workflow_run_id,scale,scheduler" > "${SUMMARY_FILE}"
+echo "run_id,run_number,local_start,local_end,local_duration,github_duration,status,workflow_run_id,scale,scheduler" > "${SUMMARY_FILE}"
 
 SUCCESSFUL_RUNS=0
 FAILED_RUNS=0
@@ -42,27 +44,31 @@ trigger() {
         -d '{"ref":"main"}'
 }
 
-latest_run() {
+get_latest_for_workflow() {
     curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs?per_page=1" | jq -r '.workflow_runs[0]'
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=1" \
+        | jq -r '.workflow_runs[0]'
+}
+
+get_details() {
+    curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs/$1"
 }
 
 wait_workflow() {
     local run_id=$1 waited=0
     while [ $waited -lt 7200 ]; do
-        STATUS=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs/${run_id}" | jq -r '.status')
+        STATUS=$(get_details "$run_id" | jq -r '.status')
         [ "$STATUS" == "completed" ] && return 0
-        echo "  ${STATUS}..."
-        sleep 60
-        waited=$((waited + 60))
+        echo "  ${STATUS}... (${waited}s)"
+        sleep 30
+        waited=$((waited + 30))
     done
     return 1
 }
 
-conclusion() {
-    curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runs/$1" | jq -r '.conclusion'
+iso_to_epoch() {
+    date -d "$1" +%s 2>/dev/null || echo "0"
 }
 
 for i in $(seq 1 ${N_RUNS}); do
@@ -71,43 +77,69 @@ for i in $(seq 1 ${N_RUNS}); do
     mkdir -p "${RUN_DIR}"
     
     echo -e "\n${YELLOW}========== SCALED HEFT RUN ${i}/${N_RUNS} ==========${NC}"
-    START_EPOCH=$(date +%s)
+    LOCAL_START=$(date +%s)
     
+    echo "Triggering workflow..."
     trigger
-    sleep 15
+    sleep 20
     
-    RUN=$(latest_run)
+    RUN=$(get_latest_for_workflow)
     RUN_ID_GH=$(echo "$RUN" | jq -r '.id')
     
     [ "$RUN_ID_GH" == "null" ] && {
-        END_EPOCH=$(date +%s)
-        echo "${RUN_ID},${i},${START_EPOCH},${END_EPOCH},$((END_EPOCH-START_EPOCH)),TRIGGER_FAILED,,2x,HEFT" >> "${SUMMARY_FILE}"
+        LOCAL_END=$(date +%s)
+        echo "${RUN_ID},${i},${LOCAL_START},${LOCAL_END},$((LOCAL_END-LOCAL_START)),0,TRIGGER_FAILED,,2x,HEFT" >> "${SUMMARY_FILE}"
         FAILED_RUNS=$((FAILED_RUNS + 1))
         continue
     }
     
     echo "GitHub Run: ${RUN_ID_GH}"
     wait_workflow "${RUN_ID_GH}"
-    RESULT=$(conclusion "${RUN_ID_GH}")
     
-    END_EPOCH=$(date +%s)
-    DURATION=$((END_EPOCH - START_EPOCH))
-    TOTAL_DURATION=$((TOTAL_DURATION + DURATION))
+    LOCAL_END=$(date +%s)
+    LOCAL_DURATION=$((LOCAL_END - LOCAL_START))
+    
+    # Get final details with GitHub timestamps
+    FINAL=$(get_details "${RUN_ID_GH}")
+    echo "$FINAL" > "${RUN_DIR}/workflow_run.json"
+    
+    RESULT=$(echo "$FINAL" | jq -r '.conclusion')
+    RUN_STARTED=$(echo "$FINAL" | jq -r '.run_started_at')
+    UPDATED=$(echo "$FINAL" | jq -r '.updated_at')
+    
+    if [ "$RUN_STARTED" != "null" ] && [ "$UPDATED" != "null" ]; then
+        START_E=$(iso_to_epoch "$RUN_STARTED")
+        END_E=$(iso_to_epoch "$UPDATED")
+        [ "$START_E" -gt 0 ] && [ "$END_E" -gt 0 ] && GITHUB_DURATION=$((END_E - START_E)) || GITHUB_DURATION=$LOCAL_DURATION
+    else
+        GITHUB_DURATION=$LOCAL_DURATION
+    fi
+    
+    TOTAL_DURATION=$((TOTAL_DURATION + GITHUB_DURATION))
     
     cat > "${RUN_DIR}/metrics.txt" << EOF
+# Scaled (2x) HEFT GitHub Actions Metrics (FIXED)
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+
 PLATFORM=GitHub_Actions_Scaled_HEFT
 SCALE=2x
 SCHEDULER=HEFT
 RUN_ID=${RUN_ID}
-DURATION_SECONDS=${DURATION}
+GITHUB_RUN_ID=${RUN_ID_GH}
+GITHUB_RUN_STARTED_AT=${RUN_STARTED}
+GITHUB_UPDATED_AT=${UPDATED}
+DURATION_SECONDS=${GITHUB_DURATION}
+LOCAL_DURATION_SECONDS=${LOCAL_DURATION}
 STATUS=${RESULT}
 EOF
     
-    echo "${RUN_ID},${i},${START_EPOCH},${END_EPOCH},${DURATION},${RESULT},${RUN_ID_GH},2x,HEFT" >> "${SUMMARY_FILE}"
+    echo "${RUN_ID},${i},${LOCAL_START},${LOCAL_END},${LOCAL_DURATION},${GITHUB_DURATION},${RESULT},${RUN_ID_GH},2x,HEFT" >> "${SUMMARY_FILE}"
     
-    [ "$RESULT" == "success" ] && { echo -e "${GREEN}✓ ${DURATION}s${NC}"; SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1)); } || { echo -e "${RED}✗ ${RESULT}${NC}"; FAILED_RUNS=$((FAILED_RUNS + 1)); }
+    [ "$RESULT" == "success" ] && { echo -e "${GREEN}✓ GitHub: ${GITHUB_DURATION}s | Local: ${LOCAL_DURATION}s${NC}"; SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1)); } || { echo -e "${RED}✗ ${RESULT}${NC}"; FAILED_RUNS=$((FAILED_RUNS + 1)); }
     
-    [ $i -lt $N_RUNS ] && sleep 60
+    [ $i -lt $N_RUNS ] && { echo "Waiting 60s..."; sleep 60; }
 done
 
-echo -e "\n${CYAN}===== COMPLETE: ${SUCCESSFUL_RUNS}/${N_RUNS} successful, avg $((TOTAL_DURATION / N_RUNS))s =====${NC}"
+[ $N_RUNS -gt 0 ] && AVG=$((TOTAL_DURATION / N_RUNS)) || AVG=0
+
+echo -e "\n${CYAN}===== COMPLETE: ${SUCCESSFUL_RUNS}/${N_RUNS} successful, avg ${AVG}s =====${NC}"
